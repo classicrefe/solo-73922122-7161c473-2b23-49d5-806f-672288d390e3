@@ -52,3 +52,29 @@ class FlowIndexRow(BaseModel):
     from_station: str
     to_station: str
     ref_count: int
+
+
+class SealRequest(BaseModel):
+    seal_day: str = Field(
+        ...,
+        description="封存日 (UTC, YYYY-MM-DD): 删除该日前的逐条扫码, "
+                    "保留历史流向索引与每件最后的历史工位; 可重复提交或往后推",
+        examples=["2026-11-24"],
+    )
+
+
+class SealOut(BaseModel):
+    seal_day: str = Field(..., description="生效后的封存日")
+    previous_seal_day: str | None = Field(..., description="之前的封存日 (首次为 null)")
+    deleted_scans: int = Field(..., description="本次删除的扫码明细条数")
+    parts_updated: int = Field(..., description="本次更新接续工位的工件数")
+
+
+class SealStateOut(BaseModel):
+    seal_day: str | None = Field(..., description="当前封存日; null 表示尚未封存")
+
+
+class PartStateRow(BaseModel):
+    part_id: str
+    last_station: str = Field(..., description="封存时该件最后一条历史扫码的工位")
+    sealed_day: str = Field(..., description="最近一次改写本记录的封存日")

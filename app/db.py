@@ -1,8 +1,11 @@
 """SQLite 连接与建表。
 
-两张表:
-- scans: 扫码明细 (每次扫码一行, scan_id 唯一)
-- flow_index: 流向索引 (同工件/同日期/同流向只保留一行, 用 ref_count 维护引用数)
+四张表:
+- scans: 扫码明细 (每次扫码一行, scan_id 唯一; 只保留未封存的)
+- flow_index: 流向索引 (同工件/同日期/同流向只保留一行, 用 ref_count 维护引用数;
+  封存不删索引, 历史流向原样保留)
+- part_state: 封存时每件最后一条历史扫码的工位 (新班次首条扫码的接续前站)
+- seal_state: 单行, 当前封存日 (无行表示尚未封存)
 
 写入一律走单连接 + threading.Lock, 配合事务保证
 "扫码和流向索引一同生效, 失败保留原状"。
@@ -61,6 +64,19 @@ CREATE TABLE IF NOT EXISTS flow_index (
 
 CREATE INDEX IF NOT EXISTS idx_flow_day
     ON flow_index (day_utc);
+
+-- 封存: 每件保留最后一条历史扫码的工位, 作为后续首条未封存扫码的接续前站
+CREATE TABLE IF NOT EXISTS part_state (
+    part_id      TEXT PRIMARY KEY,
+    last_station TEXT NOT NULL,   -- 封存时该件最后一条被删扫码的工位 (接续工位)
+    sealed_day   TEXT NOT NULL    -- 最近一次改写本记录的封存日
+);
+
+-- 单行表: 当前封存日; 删除该日前的逐条扫码, 该日及之后的明细保留
+CREATE TABLE IF NOT EXISTS seal_state (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    seal_day TEXT NOT NULL        -- 当前封存日 YYYY-MM-DD
+);
 """
 
 

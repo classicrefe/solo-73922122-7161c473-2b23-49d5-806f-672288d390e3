@@ -10,9 +10,13 @@ from .db import init_db
 from .schemas import (
     FlowCount,
     FlowIndexRow,
+    PartStateRow,
     ScanCreate,
     ScanOut,
     ScanUpdate,
+    SealOut,
+    SealRequest,
+    SealStateOut,
     WithdrawOut,
 )
 
@@ -29,8 +33,10 @@ app = FastAPI(
         "接收工位扫码并维护相邻工位流向索引。"
         "同件扫码按 (UTC 时刻, 扫码编号) 排序, 相邻工位不同才产生流向, "
         "归入后一次扫码的 UTC 日期。"
+        "支持按 UTC 日期封存: 删除封存日前的逐条扫码, 保留历史流向索引"
+        "与每件最后的历史工位, 新班次扫码自动接续。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -50,6 +56,8 @@ def create_scan(payload: ScanCreate) -> ScanOut:
     except services.ConflictError as exc:
         raise HTTPException(status_code=409,
                             detail=f"scan_id 已存在: {exc}") from exc
+    except services.SealedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -67,6 +75,8 @@ def patch_scan(scan_id: str, payload: ScanUpdate) -> ScanOut:
     except services.NotFoundError as exc:
         raise HTTPException(status_code=404,
                             detail=f"scan_id 不存在: {exc}") from exc
+    except services.SealedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -104,3 +114,27 @@ def get_flow_index(
     part_id: str | None = Query(None, description="按工件号过滤"),
 ) -> list[FlowIndexRow]:
     return [FlowIndexRow(**r) for r in services.list_flow_index(part_id)]
+
+
+@app.post("/seal", response_model=SealOut,
+          summary="封存: 删除指定 UTC 日期前的扫码明细, 保留历史流向与接续工位")
+def post_seal(payload: SealRequest) -> SealOut:
+    try:
+        return SealOut(**services.seal(payload.seal_day))
+    except services.SealRegressionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/seal", response_model=SealStateOut, summary="查看当前封存日")
+def get_seal() -> SealStateOut:
+    return SealStateOut(**services.get_seal())
+
+
+@app.get("/part-state", response_model=list[PartStateRow],
+         summary="查看每件保留的历史工位 (封存接续用, 核对用)")
+def get_part_state(
+    part_id: str | None = Query(None, description="按工件号过滤"),
+) -> list[PartStateRow]:
+    return [PartStateRow(**r) for r in services.list_part_state(part_id)]

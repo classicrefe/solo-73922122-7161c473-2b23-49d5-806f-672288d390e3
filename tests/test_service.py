@@ -264,6 +264,249 @@ def test_invalid_inputs(conn):
         services.update_scan("nope", station="X", ts_raw=None)
 
 
+# ---------------------------------------------------------------- 封存
+
+def _idx(conn) -> dict[tuple, int]:
+    """当前 flow_index 全量内容: (part, day, from, to) -> ref_count。"""
+    return {
+        (r["part_id"], r["day_utc"], r["from_station"], r["to_station"]):
+            r["ref_count"]
+        for r in conn.execute("SELECT * FROM flow_index")
+    }
+
+
+def test_seal_deletes_details_keeps_index_and_last_station(conn):
+    # P1: A(11-20) -> B(11-21) -> C(11-23); P2 全部在封存日前
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.add_scan("s2", "P1", "B", "2026-11-21T08:00:00Z")
+    services.add_scan("s3", "P1", "C", "2026-11-23T08:00:00Z")
+    services.add_scan("t1", "P2", "X", "2026-11-19T08:00:00Z")
+    services.add_scan("t2", "P2", "Y", "2026-11-21T09:00:00Z")
+    idx_before = _idx(conn)
+
+    out = services.seal("2026-11-22")
+    assert out == {"seal_day": "2026-11-22", "previous_seal_day": None,
+                   "deleted_scans": 4, "parts_updated": 2}
+    # 明细: 只剩封存日及之后的 s3
+    assert [r["scan_id"] for r in services.list_scans()] == ["s3"]
+    # 索引一行不少: 历史边 A->B(11-21), X->Y(11-21) 与接续边 B->C(11-23) 全保留
+    assert _idx(conn) == idx_before == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+        ("P2", "2026-11-21", "X", "Y"): 1,
+    }
+    # 每件保留最后的历史工位
+    assert services.list_part_state() == [
+        {"part_id": "P1", "last_station": "B", "sealed_day": "2026-11-22"},
+        {"part_id": "P2", "last_station": "Y", "sealed_day": "2026-11-22"},
+    ]
+    assert services.get_seal()["seal_day"] == "2026-11-22"
+
+
+def test_seal_idempotent_and_move_forward_keeps_stale_station(conn):
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.add_scan("s2", "P1", "B", "2026-11-21T08:00:00Z")
+    services.seal("2026-11-22")
+    snap = (_idx(conn), services.list_part_state())
+
+    # 重复提交同一封存日: 无新明细可封, 一切不变 (幂等)
+    out = services.seal("2026-11-22")
+    assert out["deleted_scans"] == 0 and out["parts_updated"] == 0
+    assert (_idx(conn), services.list_part_state()) == snap
+
+    # 封存后 P1 补登两条, 再往后推到 11-24: 只封 [11-22, 11-24) 的明细
+    services.add_scan("s3", "P1", "C", "2026-11-23T08:00:00Z")
+    services.add_scan("s4", "P1", "D", "2026-11-24T08:00:00Z")
+    services.add_scan("u1", "P3", "M", "2026-11-23T10:00:00Z")
+    out = services.seal("2026-11-24")
+    assert out["previous_seal_day"] == "2026-11-22"
+    assert out["deleted_scans"] == 2  # s3, u1 (s4 在封存日当天, 保留)
+    # P1 的接续工位更新为被删明细最后一条的 C; P3 记为 M
+    states = {r["part_id"]: r["last_station"]
+              for r in services.list_part_state()}
+    assert states == {"P1": "C", "P3": "M"}
+    assert [r["scan_id"] for r in services.list_scans()] == ["s4"]
+    # 索引: 历史边全保留, 含两次封存区间产生的边
+    assert _idx(conn) == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+        ("P1", "2026-11-24", "C", "D"): 1,
+    }
+
+
+def test_seal_move_forward_keeps_station_for_parts_without_new_scans(conn):
+    # P2 的历史工位在第一次封存时记录, 第二次封存无新明细, 必须沿用
+    services.add_scan("t1", "P2", "X", "2026-11-19T08:00:00Z")
+    services.add_scan("t2", "P2", "Y", "2026-11-20T08:00:00Z")
+    services.add_scan("s1", "P1", "A", "2026-11-21T08:00:00Z")
+    services.seal("2026-11-22")
+    assert services.list_part_state("P2")[0]["last_station"] == "Y"
+
+    services.add_scan("s2", "P1", "B", "2026-11-23T08:00:00Z")
+    services.seal("2026-11-24")
+    states = {r["part_id"]: r for r in services.list_part_state()}
+    assert states["P1"]["last_station"] == "B"   # 被删明细最后一条
+    assert states["P1"]["sealed_day"] == "2026-11-24"
+    assert states["P2"]["last_station"] == "Y"   # 沿用上次
+    assert states["P2"]["sealed_day"] == "2026-11-22"
+    assert services.get_seal()["seal_day"] == "2026-11-24"
+
+
+def test_seal_rejects_regression_and_bad_format(conn):
+    services.add_scan("s1", "P1", "A", "2026-11-21T08:00:00Z")
+    services.seal("2026-11-22")
+    with pytest.raises(services.SealRegressionError):
+        services.seal("2026-11-21")
+    with pytest.raises(ValueError):
+        services.seal("2026/11/23")
+    # 回退与格式错误都不留痕迹: 封存日、接续工位不变
+    assert services.get_seal()["seal_day"] == "2026-11-22"
+    assert services.list_part_state() == [
+        {"part_id": "P1", "last_station": "A", "sealed_day": "2026-11-22"},
+    ]
+
+
+def test_sealed_writes_rejected_but_day_of_seal_allowed(conn):
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.seal("2026-11-21")
+    # 补登到封存日前 -> 拒绝
+    with pytest.raises(services.SealedError):
+        services.add_scan("s2", "P1", "B", "2026-11-20T23:59:59Z")
+    # 封存日当天 -> 允许
+    services.add_scan("s3", "P1", "B", "2026-11-21T00:00:00Z")
+    # 改到封存日前 -> 拒绝, 且原扫码不动
+    with pytest.raises(services.SealedError):
+        services.update_scan("s3", None, "2026-11-20T10:00:00Z")
+    assert services.list_scans("P1")[0]["ts_utc"] == "2026-11-21T00:00:00.000000Z"
+    # 改工位不动日期 -> 允许; 撤回 -> 允许
+    services.update_scan("s3", "C", None)
+    services.withdraw_scan("s3")
+    assert services.list_scans() == []
+    # 唯一的未封存扫码被撤回后, 接续边也随之消失
+    assert _idx(conn) == {}
+
+
+def test_first_unsealed_scan_stitches_to_sealed_station(conn):
+    # P1: A(11-20) -> B(11-21), 封存 11-22 后无未封存明细
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.add_scan("s2", "P1", "B", "2026-11-21T08:00:00Z")
+    services.seal("2026-11-22")
+    assert _idx(conn) == {("P1", "2026-11-21", "A", "B"): 1}
+
+    # 新班次首条: 接续 B -> C
+    services.add_scan("s3", "P1", "C", "2026-11-23T08:00:00Z")
+    assert _idx(conn) == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+    }
+    # 补登更早的首条 D(11-22): 接续边重算为 B->D, 并新增 D->C
+    services.add_scan("s4", "P1", "D", "2026-11-22T08:00:00Z")
+    assert _idx(conn) == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-22", "B", "D"): 1,
+        ("P1", "2026-11-23", "D", "C"): 1,
+    }
+    # 首条 s4 改工位为同工位 B: 与虚拟前驱同工位, 接续边消失, 剩 B->C
+    services.update_scan("s4", "B", None)
+    assert _idx(conn) == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+    }
+    # 首条 s4 改期到 s3 之后: s3 成为首条, 接续边回到 B->C(11-23)
+    services.update_scan("s4", None, "2026-11-24T08:00:00Z")
+    assert _idx(conn) == {
+        ("P1", "2026-11-21", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+        ("P1", "2026-11-24", "C", "B"): 1,
+    }
+    # 撤回首条 s3: s4 成为首条, 接续边变为 B->B? 同工位无边; C->B 消失
+    services.withdraw_scan("s3")
+    assert _idx(conn) == {("P1", "2026-11-21", "A", "B"): 1}
+    # 再撤回 s4: 该件无未封存明细, 只剩历史边
+    services.withdraw_scan("s4")
+    assert _idx(conn) == {("P1", "2026-11-21", "A", "B"): 1}
+
+
+def test_seal_then_reseal_stitches_with_updated_station(conn):
+    # 两次封存之间补登的明细被第二次封存删掉后, 接续工位用最新的
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.seal("2026-11-21")
+    services.add_scan("s2", "P1", "B", "2026-11-22T08:00:00Z")
+    services.add_scan("s3", "P1", "C", "2026-11-23T08:00:00Z")
+    services.seal("2026-11-24")
+    # s2/s3 被删, 接续工位更新为 C; 索引保留全部历史边
+    assert services.list_part_state("P1")[0]["last_station"] == "C"
+    assert _idx(conn) == {
+        ("P1", "2026-11-22", "A", "B"): 1,
+        ("P1", "2026-11-23", "B", "C"): 1,
+    }
+    # 新首条接续 C -> D
+    services.add_scan("s4", "P1", "D", "2026-11-25T08:00:00Z")
+    assert _idx(conn)[("P1", "2026-11-25", "C", "D")] == 1
+
+
+def test_flows_across_seal_day_counts_part_once(conn):
+    # 同件在封存日前后走同一流向 A->B, 区间查询只算一件
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.add_scan("s2", "P1", "B", "2026-11-21T08:00:00Z")
+    services.seal("2026-11-22")
+    services.add_scan("s3", "P1", "A", "2026-11-23T08:00:00Z")
+    services.add_scan("s4", "P1", "B", "2026-11-24T08:00:00Z")
+    flows = services.query_flows("2026-11-19", "2026-11-30")
+    got = {(f["from_station"], f["to_station"]):
+           (f["part_count"], f["event_count"]) for f in flows}
+    # A->B 两天各一次: 同件去重计 1, 事件计 2; 接续边 B->A 一次
+    assert got[("A", "B")] == (1, 2)
+    assert got[("B", "A")] == (1, 1)
+    # 只查封存日后: 仍各一件
+    flows2 = services.query_flows("2026-11-22", "2026-11-30")
+    got2 = {(f["from_station"], f["to_station"]): f["part_count"]
+            for f in flows2}
+    assert got2 == {("B", "A"): 1, ("A", "B"): 1}
+
+
+def test_seal_rolls_back_on_failure(conn):
+    services.add_scan("s1", "P1", "A", "2026-11-20T08:00:00Z")
+    services.add_scan("s2", "P1", "B", "2026-11-21T08:00:00Z")
+    scans_before = services.list_scans()
+    idx_before = _idx(conn)
+
+    # 用触发器让 DELETE 在事务中段失败 (此时 part_state 已写入)
+    conn.execute(
+        """
+        CREATE TRIGGER block_delete BEFORE DELETE ON scans
+        BEGIN SELECT RAISE(ABORT, 'simulated seal failure'); END
+        """
+    )
+    conn.commit()
+    with pytest.raises(sqlite3.Error):
+        services.seal("2026-11-22")
+    conn.execute("DROP TRIGGER block_delete")
+    conn.commit()
+
+    # 明细、索引、接续工位、封存日均保留原状
+    assert services.list_scans() == scans_before
+    assert _idx(conn) == idx_before
+    assert services.list_part_state() == []
+    assert services.get_seal()["seal_day"] is None
+    # 失败后仍可正常封存
+    services.seal("2026-11-22")
+    assert services.get_seal()["seal_day"] == "2026-11-22"
+    assert services.list_part_state("P1")[0]["last_station"] == "B"
+
+
+def test_seal_without_scans_and_empty_part(conn):
+    # 空库封存: 正常生效
+    out = services.seal("2026-11-20")
+    assert out["deleted_scans"] == 0 and out["parts_updated"] == 0
+    assert services.get_seal()["seal_day"] == "2026-11-20"
+    # 新件直接在封存日后出现: 无虚拟前驱, 行为与未封存一致
+    services.add_scan("s1", "P9", "A", "2026-11-21T08:00:00Z")
+    services.add_scan("s2", "P9", "B", "2026-11-21T09:00:00Z")
+    assert _idx(conn) == {("P9", "2026-11-21", "A", "B"): 1}
+    assert services.list_part_state() == []
+
+
 if __name__ == "__main__":
     # 无 pytest 环境下的简易回退执行器
     sys.exit(pytest.main([__file__, "-q"]))

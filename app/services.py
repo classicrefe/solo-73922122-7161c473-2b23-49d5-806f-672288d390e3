@@ -1,4 +1,4 @@
-"""核心业务逻辑: 扫码增/改/撤 + 流向索引的增量维护。
+"""核心业务逻辑: 扫码增/改/撤 + 流向索引的增量维护 + 班次封存。
 
 规则
 ----
@@ -14,6 +14,20 @@
 flow_index 主键去重: 同件同日同流向只占一行, ref_count 记出现次数。
 查询按行计数即可, 重复次数增加不会增加索引行数。
 
+封存
+----
+POST /seal 指定 UTC 封存日 D: 删除 day_utc < D 的逐条扫码, 但
+- flow_index 不动: 历史流向 (含被删明细间、被删末条到幸存首条的接续边)
+  原样保留, /flows 跨封存日口径不变;
+- part_state 记录每件被删明细中最后一条的工位 ("接续工位");
+- 封存日可重复提交 (幂等), 也可往后推; 往后推时没有新明细可封的工件
+  沿用上次的接续工位; 不允许回退到更早的封存日。
+
+封存后未封存明细仍可增改撤, 但拒绝把扫码补登/改到封存日前。
+当某件的首条未封存扫码没有真实前驱时, 用 part_state 保留的接续工位
+充当"虚拟前驱"参与同一套增量边维护 —— 仍然只查改动处的相邻扫码,
+首条变化 (新增更早首条/撤回首条/首条改期) 时接续流向随之重算。
+
 每个公开写操作在一个事务内完成, 任何一步失败整体回滚, 保留原状。
 """
 from __future__ import annotations
@@ -27,6 +41,9 @@ from .db import get_conn, write_lock
 TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 DAY_FMT = "%Y-%m-%d"
 
+# 流向边端点: 真实扫码行, 或封存接续工位构成的虚拟前驱
+EdgeEnd = sqlite3.Row | dict[str, Any]
+
 
 class ConflictError(Exception):
     """scan_id 已存在。"""
@@ -34,6 +51,14 @@ class ConflictError(Exception):
 
 class NotFoundError(Exception):
     """scan_id 不存在。"""
+
+
+class SealedError(Exception):
+    """扫码落在封存日之前, 拒绝补登 / 改期。"""
+
+
+class SealRegressionError(Exception):
+    """封存日只允许重复提交或往后推, 不允许回退。"""
 
 
 def parse_ts(raw: str) -> datetime:
@@ -101,10 +126,35 @@ def _next_row(
     ).fetchone()
 
 
+def _sealed_prev(conn: sqlite3.Connection, part_id: str) -> dict[str, Any] | None:
+    """封存保留的接续工位, 充当首条未封存扫码的虚拟前驱。"""
+    row = conn.execute(
+        "SELECT last_station FROM part_state WHERE part_id = ?", (part_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"station": row["last_station"]}
+
+
+def _current_seal_day(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT seal_day FROM seal_state WHERE id = 1").fetchone()
+    return row["seal_day"] if row is not None else None
+
+
+def _check_not_sealed(conn: sqlite3.Connection, day_utc: str,
+                      scan_id: str) -> None:
+    """拒绝把扫码补登/改到封存日之前 (封存日当天及之后允许)。"""
+    seal_day = _current_seal_day(conn)
+    if seal_day is not None and day_utc < seal_day:
+        raise SealedError(
+            f"扫码 {scan_id} 的日期 {day_utc} 早于封存日 {seal_day}, 拒绝写入"
+        )
+
+
 # ---------------------------------------------------------------- 流向边维护
 
-def _add_edge(conn: sqlite3.Connection, a: sqlite3.Row | None,
-              b: sqlite3.Row | None) -> None:
+def _add_edge(conn: sqlite3.Connection, a: EdgeEnd | None,
+              b: EdgeEnd | None) -> None:
     """加入一条 a -> b 的流向边 (b 为后一次扫码, 日期取 b.day_utc)。
 
     相邻两次工位相同则不产生流向; 去重由主键保证, 重复出现只累加引用数。
@@ -124,8 +174,8 @@ def _add_edge(conn: sqlite3.Connection, a: sqlite3.Row | None,
     )
 
 
-def _remove_edge(conn: sqlite3.Connection, a: sqlite3.Row | None,
-                 b: sqlite3.Row | None) -> None:
+def _remove_edge(conn: sqlite3.Connection, a: EdgeEnd | None,
+                 b: EdgeEnd | None) -> None:
     """移除一条 a -> b 流向边的一次引用; 引用归零即删除索引行。"""
     if a is None or b is None:
         return
@@ -158,8 +208,11 @@ def _remove_edge(conn: sqlite3.Connection, a: sqlite3.Row | None,
 def _insert_scan_row(conn: sqlite3.Connection, scan_id: str, part_id: str,
                      station: str, ts_utc: str, day_utc: str) -> None:
     """在已开启的事务内插入一条扫码并增量更新流向 (只碰前后相邻)。"""
-    prev = _prev_row(conn, part_id, ts_utc, scan_id)
+    prev: EdgeEnd | None = _prev_row(conn, part_id, ts_utc, scan_id)
     nxt = _next_row(conn, part_id, ts_utc, scan_id)
+    if prev is None:
+        # 成为首条未封存扫码: 用封存保留的接续工位作为虚拟前驱
+        prev = _sealed_prev(conn, part_id)
 
     # 新边把旧的 prev->next 邻接关系替换成 prev->new 与 new->next
     _remove_edge(conn, prev, nxt)
@@ -178,8 +231,12 @@ def _delete_scan_row(conn: sqlite3.Connection, scan_id: str) -> sqlite3.Row:
     old = _get_scan(conn, scan_id)
     if old is None:
         raise NotFoundError(scan_id)
-    prev = _prev_row(conn, old["part_id"], old["ts_utc"], old["scan_id"])
+    prev: EdgeEnd | None = _prev_row(
+        conn, old["part_id"], old["ts_utc"], old["scan_id"])
     nxt = _next_row(conn, old["part_id"], old["ts_utc"], old["scan_id"])
+    if prev is None:
+        # 撤回的是首条未封存扫码: 接续边挂在封存保留的工位上
+        prev = _sealed_prev(conn, old["part_id"])
 
     _remove_edge(conn, prev, old)
     _remove_edge(conn, old, nxt)
@@ -200,6 +257,7 @@ def add_scan(scan_id: str, part_id: str, station: str, ts_raw: str) -> dict[str,
             conn.execute("BEGIN IMMEDIATE")
             if _get_scan(conn, scan_id) is not None:
                 raise ConflictError(scan_id)
+            _check_not_sealed(conn, day_utc, scan_id)
             _insert_scan_row(conn, scan_id, part_id, station, ts_utc, day_utc)
             conn.commit()
         except Exception:
@@ -231,6 +289,7 @@ def update_scan(scan_id: str, station: str | None, ts_raw: str | None) -> dict[s
                 new_ts, new_day = old["ts_utc"], old["day_utc"]
             else:
                 new_ts, new_day = format_ts(new_dt), day_of(new_dt)
+            _check_not_sealed(conn, new_day, scan_id)
 
             _delete_scan_row(conn, scan_id)
             _insert_scan_row(conn, scan_id, part_id, new_station, new_ts, new_day)
@@ -259,6 +318,98 @@ def withdraw_scan(scan_id: str) -> dict[str, Any]:
         "station": old["station"], "ts_utc": old["ts_utc"],
         "day_utc": old["day_utc"], "withdrawn": True,
     }
+
+
+# ---------------------------------------------------------------- 封存
+
+def seal(seal_day: str) -> dict[str, Any]:
+    """封存 seal_day (UTC) 之前的逐条扫码, 保留历史流向与接续工位。
+
+    - 删除 day_utc < seal_day 的扫码明细; flow_index 不动, 历史流向
+      (含被删末条到幸存首条的接续边) 原样保留;
+    - 每件被删明细中最后一条的工位写入 part_state, 作为后续首条
+      未封存扫码的虚拟前驱; 没有新明细可封的工件沿用上次记录的工位;
+    - 可重复提交 (幂等) 或往后推; 回退到更早的封存日抛 SealRegressionError;
+    - 明细删除、接续工位、封存日在同一事务内提交, 失败全部保留原状。
+    """
+    seal_day = _validate_day(seal_day, "seal_day")
+    conn = get_conn()
+    with write_lock():
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _current_seal_day(conn)
+            if current is not None and seal_day < current:
+                raise SealRegressionError(
+                    f"封存日不能回退: 当前 {current}, 收到 {seal_day}"
+                )
+            # 每件在封存日前的最后一条扫码, 其工位即该件的接续工位
+            last_rows = conn.execute(
+                """
+                SELECT part_id, station FROM (
+                    SELECT part_id, station,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY part_id
+                               ORDER BY ts_utc DESC, scan_id DESC
+                           ) AS rn
+                    FROM scans
+                    WHERE day_utc < ?
+                ) WHERE rn = 1
+                """,
+                (seal_day,),
+            ).fetchall()
+            for r in last_rows:
+                conn.execute(
+                    """
+                    INSERT INTO part_state (part_id, last_station, sealed_day)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(part_id) DO UPDATE SET
+                        last_station = excluded.last_station,
+                        sealed_day   = excluded.sealed_day
+                    """,
+                    (r["part_id"], r["station"], seal_day),
+                )
+            deleted = conn.execute(
+                "DELETE FROM scans WHERE day_utc < ?", (seal_day,)
+            ).rowcount
+            if current is None:
+                conn.execute(
+                    "INSERT INTO seal_state (id, seal_day) VALUES (1, ?)",
+                    (seal_day,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE seal_state SET seal_day = ? WHERE id = 1",
+                    (seal_day,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {
+        "seal_day": seal_day,
+        "previous_seal_day": current,
+        "deleted_scans": deleted,
+        "parts_updated": len(last_rows),
+    }
+
+
+def get_seal() -> dict[str, Any]:
+    conn = get_conn()
+    return {"seal_day": _current_seal_day(conn)}
+
+
+def list_part_state(part_id: str | None = None) -> list[dict[str, Any]]:
+    """每件保留的接续工位 (封存时最后一条历史扫码的工位)。"""
+    conn = get_conn()
+    if part_id is None:
+        rows = conn.execute(
+            "SELECT * FROM part_state ORDER BY part_id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM part_state WHERE part_id = ?", (part_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 查询 (只读索引)
